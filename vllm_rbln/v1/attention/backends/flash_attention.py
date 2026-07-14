@@ -29,6 +29,7 @@ from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm_rbln.v1.kv_cache import RBLNPrefillAwareSlidingWindowSpec
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -38,6 +39,11 @@ import vllm_rbln.rbln_envs as envs
 import vllm_rbln.utils as rbln_utils
 from vllm_rbln.logger import init_logger
 from vllm_rbln.v1.attention.kv_cache_bindings import KVCacheViewInfo
+from vllm_rbln.v1.attention.prefill_aware_swa import (
+    PrefillAwareSWAStatus,
+    detect_prefill_aware_swa_status_from_vllm_config,
+    maybe_raise_for_incompatible_regular_swa,
+)
 
 logger = init_logger(__name__)
 
@@ -1026,6 +1032,16 @@ class RBLNFlashAttentionMetadata:
     local_block_tables: torch.Tensor | None = None
     swa_attn_masks: torch.Tensor | None = None
 
+    # PA-SWA production-path status. This is metadata/guard plumbing only;
+    # active=True requires a future backend-ready KV-cache/kernel path.
+    prefill_aware_swa_required: bool = False
+    prefill_aware_swa_backend_ready: bool = False
+    prefill_aware_swa_active: bool = False
+    prefill_aware_swa_sliding_window: int | None = None
+    single_block_id: int | None = None
+    single_slot_id: int | None = None
+    slot_update_mask: torch.Tensor | None = None
+
 
 class RBLNFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[RBLNFlashAttentionMetadata]
@@ -1069,8 +1085,16 @@ class RBLNFlashAttentionMetadataBuilder(
         self.is_causal = envs.VLLM_RBLN_FLASH_CAUSAL_ATTN
         self.is_batch_attention_opt = envs.VLLM_RBLN_BATCH_ATTN_OPT
 
+        self.prefill_aware_swa_status: PrefillAwareSWAStatus = (
+            detect_prefill_aware_swa_status_from_vllm_config(vllm_config)
+        )
+
         self._swa_cache_seq_lens_buf: torch.Tensor | None = None
         self._swa_cache_offsets_buf: torch.Tensor | None = None
+        # Stable request-id access is not exposed in CommonAttentionMetadata.
+        # The first allocated KV block is stable for a live request, so use it
+        # to remember the prompt/prefill boundary needed by PA-SWA decode.
+        self._pa_swa_prefill_lens_by_first_block: dict[int, int] = {}
 
     def _to_device_inplace(
         self, cpu_tensor: torch.Tensor, attr_name: str
@@ -1093,6 +1117,65 @@ class RBLNFlashAttentionMetadataBuilder(
     ) -> bool:
         return False
 
+    @staticmethod
+    def _first_block_key(block_row: torch.Tensor) -> int | None:
+        if block_row.numel() == 0:
+            return None
+        first_block = int(block_row.reshape(-1)[0].item())
+        return first_block if first_block >= 0 else None
+
+    def _record_pa_swa_prefill_lens(
+        self, block_tables_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
+    ) -> None:
+        for batch_index in range(min(block_tables_cpu.shape[0], seq_lens_cpu.numel())):
+            key = self._first_block_key(block_tables_cpu[batch_index])
+            if key is None:
+                continue
+            prefill_len = int(seq_lens_cpu[batch_index].item())
+            # A prefill build marks ownership of this first block for the
+            # current request.  Overwrite rather than keep max(): production
+            # block reuse can assign the same first block to a later shorter
+            # request, and a stale larger prefill boundary would make PA-SWA
+            # decode masks preserve too many prefix tokens.  Chunked prefill
+            # still observes monotonically growing seq_lens before decode.
+            self._pa_swa_prefill_lens_by_first_block[key] = prefill_len
+
+    def _build_pa_swa_decode_mask(
+        self,
+        *,
+        block_tables_cpu: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        batch_pad: int,
+        max_seq_len: int,
+        sliding_window: int,
+    ) -> torch.Tensor:
+        mask = torch.zeros(
+            batch_pad,
+            1,
+            1,
+            1,
+            max_seq_len,
+            dtype=torch.float16 if self.enforce_eager else torch.float32,
+        )
+        for batch_index in range(min(block_tables_cpu.shape[0], seq_lens_cpu.numel())):
+            key = self._first_block_key(block_tables_cpu[batch_index])
+            # Existing RBLN decode mask treats seq_lens as the cached length
+            # before inserting the one-token query, hence +1 for visible length.
+            visible_seq_len = min(
+                int(seq_lens_cpu[batch_index].item()) + 1, max_seq_len
+            )
+            prefill_len = self._pa_swa_prefill_lens_by_first_block.get(
+                key if key is not None else -1,
+                min(int(seq_lens_cpu[batch_index].item()), visible_seq_len),
+            )
+            prefill_len = max(0, min(prefill_len, visible_seq_len))
+            decode_start = max(prefill_len, visible_seq_len - sliding_window)
+            if prefill_len > 0:
+                mask[batch_index, :, :, :, :prefill_len] = 1
+            if decode_start < visible_seq_len:
+                mask[batch_index, :, :, :, decode_start:visible_seq_len] = 1
+        return mask
+
     def build(
         self,
         common_prefix_len: int,
@@ -1111,6 +1194,8 @@ class RBLNFlashAttentionMetadataBuilder(
         seq_lens = common_attn_metadata.seq_lens
         block_tables_tensor = common_attn_metadata.block_table_tensor
         slot_mapping = common_attn_metadata.slot_mapping
+        block_tables_for_pa_cpu = block_tables_tensor[:num_reqs].detach().cpu()
+        single_block_id = self._first_block_key(block_tables_for_pa_cpu[0])
         if use_dt:
             # Prefer the pre-existing CPU copy to avoid an extra D2H sync;
             # arithmetic stays on CPU until .to(self.device) in the constructor.
@@ -1127,7 +1212,14 @@ class RBLNFlashAttentionMetadataBuilder(
         else:
             query_seq_lens = query_start_loc[1:] - query_start_loc[:-1]
             num_computed_tokens = seq_lens - query_seq_lens
+            seq_lens_cpu = seq_lens[:num_reqs].detach().cpu()
+            num_computed_tokens_cpu = num_computed_tokens[:num_reqs].detach().cpu()
             seq_idx = positions[query_start_loc[:num_reqs]].view(-1, 1)
+        single_slot_id = (
+            int(slot_mapping.reshape(-1)[0].item())
+            if slot_mapping.numel() == 1
+            else None
+        )
 
         cu_prefix_query_lens = None
         prefix_kv_lens = None
@@ -1153,6 +1245,10 @@ class RBLNFlashAttentionMetadataBuilder(
 
         attn_masks = None
         if is_prefill:
+            if self.prefill_aware_swa_status.active:
+                self._record_pa_swa_prefill_lens(
+                    block_tables_for_pa_cpu, seq_lens_cpu[:num_reqs]
+                )
             # NOTE(jiwoo.park) prefill's block_tables must be a 1D tensor.
             block_tables_tensor = block_tables_tensor[0]
             if not self.is_causal:
@@ -1197,12 +1293,48 @@ class RBLNFlashAttentionMetadataBuilder(
                     decode_attention_mask[batch_index, :, :, :, : batch_step + 1] = 1
                 attn_masks = decode_attention_mask
                 attn_masks = attn_masks.to(self.device)
+            if self.prefill_aware_swa_status.active:
+                if self.prefill_aware_swa_status.sliding_window is None:
+                    raise NotImplementedError(
+                        "PA-SWA is active but sliding_window is not configured."
+                    )
+                attn_masks = self._build_pa_swa_decode_mask(
+                    block_tables_cpu=block_tables_for_pa_cpu,
+                    seq_lens_cpu=seq_lens_cpu[:num_reqs],
+                    batch_pad=batch_pad,
+                    max_seq_len=max_seq_len,
+                    sliding_window=self.prefill_aware_swa_status.sliding_window,
+                ).to(self.device)
+
+        slot_update_mask = None
+        if self.prefill_aware_swa_status.active and not is_prefill:
+            slot_update_mask = torch.zeros(
+                batch_pad,
+                1,
+                1,
+                max_seq_len,
+                1,
+                dtype=torch.float16 if self.enforce_eager else torch.float32,
+            )
+            for batch_index in range(
+                min(block_tables_for_pa_cpu.shape[0], slot_mapping.numel())
+            ):
+                slot_id = int(slot_mapping.reshape(-1)[batch_index].item())
+                if 0 <= slot_id < max_seq_len:
+                    slot_update_mask[batch_index, :, :, slot_id, :] = 1
 
         cache_seq_lens = None
         cache_offsets = None
         local_block_tables = None
         swa_attn_masks = None
-        if sliding_window := getattr(self.kv_cache_spec, "sliding_window", None):
+        if (
+            sliding_window := getattr(self.kv_cache_spec, "sliding_window", None)
+        ) and not isinstance(self.kv_cache_spec, RBLNPrefillAwareSlidingWindowSpec):
+            maybe_raise_for_incompatible_regular_swa(
+                self.prefill_aware_swa_status,
+                sliding_window=sliding_window,
+                location="RBLNFlashAttentionMetadataBuilder.build",
+            )
             nct_src = (
                 num_computed_tokens_cpu if use_dt else num_computed_tokens[:num_reqs]
             )
@@ -1263,6 +1395,19 @@ class RBLNFlashAttentionMetadataBuilder(
             swa_attn_masks=swa_attn_masks.to(self.device)
             if swa_attn_masks is not None
             else None,
+            prefill_aware_swa_required=self.prefill_aware_swa_status.required,
+            prefill_aware_swa_backend_ready=(
+                self.prefill_aware_swa_status.backend_ready
+            ),
+            prefill_aware_swa_active=self.prefill_aware_swa_status.active,
+            prefill_aware_swa_sliding_window=(
+                self.prefill_aware_swa_status.sliding_window
+            ),
+            single_block_id=single_block_id,
+            single_slot_id=single_slot_id,
+            slot_update_mask=slot_update_mask.to(self.device)
+            if slot_update_mask is not None
+            else None,
         )
 
         return attn_metadata
@@ -1308,7 +1453,19 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         if alibi_slopes is not None:
             alibi_slopes = torch.tensor(alibi_slopes, dtype=torch.float32)
         self.alibi_slopes = alibi_slopes
-        self.sliding_window = sliding_window
+        self.prefill_aware_swa_status = (
+            detect_prefill_aware_swa_status_from_vllm_config(vllm_config)
+        )
+        self.pa_swa_sliding_window = (
+            self.prefill_aware_swa_status.sliding_window
+            if self.prefill_aware_swa_status.active
+            else None
+        )
+        # PA-SWA is not regular SWA: do not route it through the one-block
+        # sliding-window kernel, which would evict protected prefill KV.
+        self.sliding_window = (
+            None if self.prefill_aware_swa_status.active else sliding_window
+        )
         self.kv_cache_dtype = kv_cache_dtype
         if logits_soft_cap is None:
             # In flash-attn, setting logits_soft_cap as 0 means no soft cap.
@@ -1320,7 +1477,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
         # unused?
         self.need_mask = (
-            self.alibi_slopes is not None or self.sliding_window is not None
+            self.alibi_slopes is not None
+            or self.sliding_window is not None
+            or self.prefill_aware_swa_status.active
         )
 
         supported_head_sizes = RBLNAttentionBackend.get_supported_head_sizes()
@@ -1361,6 +1520,8 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         kv_cache: torch.Tensor,
         attn_metadata: RBLNFlashAttentionMetadata,
         output: torch.Tensor | None = None,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass with xFormers and PagedAttention.
 
@@ -1391,20 +1552,52 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # NB- num batch
 
         # 1. query reshape for custom operation
-        # query = [b_size(batch), q_len(query len), num_heads * head_size]
-        b_size, q_len, _ = query.size()
-        query = query.view(b_size, q_len, self.num_heads, self.head_size).transpose(
-            1, 2
-        )
+        # vLLM's own Attention.forward() now always pre-splits heads before
+        # calling into an impl -- query/key/value arrive as
+        # [num_tokens, num_heads_q_or_kv, head_size] (last dim == head_size).
+        # Older/direct-call RBLN paths may instead pass flattened
+        # [tokens, hidden] (2D) or already-batched [batch, seq, hidden] (3D,
+        # last dim == num_heads * head_size). Detect by the trailing dim
+        # rather than by ndim alone, since ndim==3 is now ambiguous between
+        # the two 3D conventions.
+        restore_flattened_output = False
+        already_per_head = query.shape[-1] == self.head_size
+        if already_per_head:
+            # [tokens, heads, head_size] -> [1, heads, tokens, head_size]
+            b_size = 1
+            q_len = query.shape[0]
+            query = query.unsqueeze(0).transpose(1, 2)
+            key = key.unsqueeze(0).transpose(1, 2)
+            value = value.unsqueeze(0).transpose(1, 2)
+        else:
+            if query.ndim == 2:
+                restore_flattened_output = True
+                query = query.unsqueeze(0)
+                key = key.unsqueeze(0)
+                value = value.unsqueeze(0)
+            b_size, q_len, _ = query.size()
+            query = query.view(
+                b_size, q_len, self.num_heads, self.head_size
+            ).transpose(1, 2)
+            key = key.view(b_size, q_len, self.num_kv_heads, self.head_size).transpose(
+                1, 2
+            )
+            value = value.view(
+                b_size, q_len, self.num_kv_heads, self.head_size
+            ).transpose(1, 2)
         query = query.view(
             b_size, self.num_kv_heads, self.num_queries_per_kv, q_len, self.head_size
         )
-        key = key.view(b_size, q_len, self.num_kv_heads, self.head_size).transpose(1, 2)
         key = key.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
-        value = value.view(b_size, q_len, self.num_kv_heads, self.head_size).transpose(
-            1, 2
-        )
         value = value.view(b_size, self.num_kv_heads, 1, q_len, self.head_size)
+
+        # RBLN/TVM custom-op inputs must be backed by contiguous DLTensors.
+        # vLLM gives flattened token tensors; the head transpose/view sequence
+        # above can create strided views even when the original input is
+        # contiguous, which makes RBLN lowering fall back to CPU.
+        query = query.contiguous()
+        key = key.contiguous()
+        value = value.contiguous()
 
         # NOTE - for cache update,
         # slot mapping will be necessary from sequence index
@@ -1436,7 +1629,161 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
         # attn_output = [batch,H,4,L,D]
         assert kv_cache is not None
 
-        if self.sliding_window is not None:
+        # Unlimited-OCR / DeepSeekV2 uses MHA here
+        # (num_queries_per_kv == 1, head_dim == 128).  The current RBLN custom
+        # causal-attention lowering assumes a GQA grouping shape and can infer
+        # a zero-sized output channel for this MHA prefill shape.  For the
+        # correctness-first decoder compile path, use explicit torch ops for
+        # prefill MHA and leave decode/cache-specialized kernels as the next
+        # optimization target.
+        if (
+            self.num_queries_per_kv == 1
+            and attn_metadata.prefill_aware_swa_active
+            and attn_metadata.is_prefill
+        ):
+            assert attn_metadata.block_tables is not None
+            assert attn_metadata.slot_mapping is not None
+            if b_size != 1 or attn_metadata.block_tables.numel() != 1:
+                raise AssertionError(
+                    "MHA prefill correctness path only supports batch=1 and "
+                    "a single KV block; multi-block MHA prefill requires "
+                    "slot/block scatter support."
+                )
+            if q_len > kv_cache.size(-2):
+                raise AssertionError(
+                    "MHA prefill correctness path requires a single cache "
+                    f"partition: q_len={q_len}, cache={kv_cache.size(-2)}"
+                )
+            expected_slots = torch.arange(
+                q_len,
+                dtype=attn_metadata.slot_mapping.dtype,
+                device=attn_metadata.slot_mapping.device,
+            )
+            if not torch.equal(
+                attn_metadata.slot_mapping.reshape(-1)[:q_len], expected_slots
+            ):
+                raise AssertionError(
+                    "MHA prefill correctness path requires contiguous slots "
+                    "starting at zero."
+                )
+            q_mha = query.squeeze(2)
+            k_mha = key.squeeze(2).to(q_mha.dtype)
+            v_mha = value.squeeze(2)
+            # Keep the correctness-first MHA prefill path compatible with
+            # cached decode.  The previous prefill-only compile probe did not
+            # need a populated KV cache, but PA-SWA decode must preserve all
+            # prefill K/V and then append the sliding decode tail.  Use the
+            # same single-block layout as the eager reference kernels.
+            block = (
+                attn_metadata.single_block_id
+                if attn_metadata.single_block_id is not None
+                else int(attn_metadata.block_tables.reshape(-1)[0].item())
+            )
+            k_state = kv_cache[0][block].unsqueeze(0)
+            v_state = kv_cache[1][block].unsqueeze(0)
+            kv_cache[0][block] = k_state.slice_scatter(
+                key, dim=3, start=0, end=q_len
+            ).squeeze(0)
+            kv_cache[1][block] = v_state.slice_scatter(
+                value, dim=3, start=0, end=q_len
+            ).squeeze(0)
+            attn_weights = torch.matmul(q_mha, k_mha.transpose(-2, -1)) * self.scale
+            causal_mask = torch.tril(
+                torch.ones(
+                    q_len,
+                    q_len,
+                    dtype=attn_weights.dtype,
+                    device=attn_weights.device,
+                )
+            ).view(1, 1, q_len, q_len)
+            attn_weights = attn_weights + (1.0 - causal_mask) * torch.finfo(
+                attn_weights.dtype
+            ).min
+            attn_probs = torch.nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(q_mha.dtype)
+            attn_output = torch.matmul(
+                attn_probs, v_mha.to(attn_probs.dtype)
+            ).unsqueeze(2)
+
+        elif (
+            self.num_queries_per_kv == 1
+            and attn_metadata.prefill_aware_swa_active
+            and not attn_metadata.is_prefill
+        ):
+            # Correctness-first MHA decode companion for the prefill path above.
+            #
+            # PA-SWA cached decode requires the decode token to be appended to
+            # the same single-block cache filled during prefill, then attended
+            # with the prefill-aware visibility mask. The generic custom op path
+            # below is optimized for the usual grouped-query layout; for
+            # Unlimited-OCR's MHA shape it can silently produce wrong next-token
+            # logits in the experimental cached probe. Keep this opt-in path
+            # explicit and narrow until a compiled token-level PA-SWA kernel is
+            # added.
+            if q_len != 1:
+                raise AssertionError("PA-SWA MHA decode probe expects q_len == 1")
+            assert attn_metadata.attn_masks is not None
+            assert attn_metadata.block_tables is not None
+            assert attn_metadata.slot_mapping is not None
+            if (
+                b_size != 1
+                or kv_cache.size(1) != 1
+                or attn_metadata.block_tables.numel() != 1
+                or attn_metadata.slot_mapping.numel() != 1
+                or attn_metadata.attn_masks.size(0) != 1
+            ):
+                raise AssertionError(
+                    "PA-SWA MHA decode probe only supports batch=1, one "
+                    "block-table entry, and one decode slot."
+                )
+
+            block = (
+                attn_metadata.single_block_id
+                if attn_metadata.single_block_id is not None
+                else int(attn_metadata.block_tables.reshape(-1)[0].item())
+            )
+            assert attn_metadata.slot_update_mask is not None
+            k_state = kv_cache[0][block].unsqueeze(0).clone()
+            v_state = kv_cache[1][block].unsqueeze(0).clone()
+            slot_mask = attn_metadata.slot_update_mask[
+                :, :, :, : kv_cache.size(-2), :
+            ].to(device=key.device)
+            k_state = torch.where(slot_mask > 0, key.to(k_state.dtype), k_state)
+            v_state = torch.where(slot_mask > 0, value.to(v_state.dtype), v_state)
+            updated_kv_cache = torch.stack(
+                (k_state.squeeze(0), v_state.squeeze(0)), dim=0
+            ).unsqueeze(1)
+            kv_cache[0][block] = k_state.squeeze(0)
+            kv_cache[1][block] = v_state.squeeze(0)
+            self._pa_swa_updated_kv_cache = updated_kv_cache
+
+            q_mha = query.squeeze(2)
+            k_mha = k_state.squeeze(2).to(q_mha.dtype)
+            v_mha = v_state.squeeze(2)
+            attn_weights = torch.matmul(q_mha, k_mha.transpose(-2, -1)) * self.scale
+            visibility_mask = attn_metadata.attn_masks[
+                :, :, :, :, : kv_cache.size(-2)
+            ].reshape(b_size, 1, q_len, kv_cache.size(-2))
+            additive_mask = torch.where(
+                visibility_mask > 0,
+                torch.zeros((), dtype=attn_weights.dtype, device=attn_weights.device),
+                torch.full(
+                    (),
+                    torch.finfo(attn_weights.dtype).min,
+                    dtype=attn_weights.dtype,
+                    device=attn_weights.device,
+                ),
+            )
+            attn_weights = attn_weights + additive_mask
+            attn_probs = torch.nn.functional.softmax(
+                attn_weights, dim=-1, dtype=torch.float32
+            ).to(q_mha.dtype)
+            attn_output = torch.matmul(
+                attn_probs, v_mha.to(attn_probs.dtype)
+            ).unsqueeze(2)
+
+        elif self.sliding_window is not None:
             assert self.sliding_window == kv_cache.size(-2), (
                 "SWA kernel_block_size must match window_size"
             )
@@ -1506,7 +1853,9 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
                     *prefill_args
                 )
         # actually non-flash paged attention DOES NOT use slot_mapping
-        elif self.is_causal:
+        elif self.is_causal and not (
+            attn_metadata.prefill_aware_swa_active and not attn_metadata.is_prefill
+        ):
             if self.is_normal:
                 assert attn_metadata.seq_lens is not None
                 assert attn_metadata.block_tables is not None
@@ -1743,8 +2092,10 @@ class RBLNFlashAttentionImpl(AttentionImpl[RBLNFlashAttentionMetadata]):
             attn_output = attn_output.view(
                 b_size, self.num_heads, q_len, self.head_size
             ).transpose(1, 2)
-            attn_output = attn_output.view(
+            attn_output = attn_output.contiguous().view(
                 b_size, q_len, self.num_heads * self.head_size
             )
         # attn_output = [batch,L,H*4*D]
+        if restore_flattened_output:
+            attn_output = attn_output.squeeze(0)
         return attn_output

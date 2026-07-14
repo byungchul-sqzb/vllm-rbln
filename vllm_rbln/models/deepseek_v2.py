@@ -17,33 +17,26 @@ from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.models.deepseek_v2 import DeepseekV2Attention, DeepseekV2MoE
 
 
-def __deepseek_v2_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
-    if self.n_shared_experts is not None:
-        shared_output = self.shared_experts(hidden_states)
-    if hidden_states.dtype != torch.float16:
-        final_hidden_states = (
-            self.experts(hidden_states=hidden_states, router=lambda x: self.gate(x)[0])
-            * self.routed_scaling_factor
-        )
-    else:
-        # Fix FP16 overflow
-        # See DeepseekV2DecoderLayer for more details.
-        final_hidden_states = self.experts(
-            hidden_states=hidden_states, router=lambda x: self.gate(x)[0]
-        )
-    if shared_output is not None:
-        if hidden_states.dtype != torch.float16:
-            final_hidden_states = final_hidden_states + shared_output
-        else:
-            # Fix FP16 overflow
-            # See DeepseekV2DecoderLayer for more details.
-            final_hidden_states = final_hidden_states + shared_output * (
-                1.0 / self.routed_scaling_factor
-            )
-    if self.tp_size > 1:
-        final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+_upstream_deepseek_v2_moe_forward = DeepseekV2MoE.forward
 
-    return final_hidden_states
+
+def __deepseek_v2_moe_forward_rsd(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    # NOTE(RBLN): This override existed for an older vLLM where FusedMoE
+    # dispatched to `forward_oot` and returned ONLY the routed-expert output
+    # (no shared experts, no routed-scaling applied), so DeepseekV2MoE had to
+    # add `shared_experts(x)` and multiply by `routed_scaling_factor` itself.
+    #
+    # On current vLLM, `FusedMoE.forward` is a concrete method that runs the
+    # MoERunner, which already: (1) computes and adds the shared-expert output
+    # (FusedMoE is constructed with `shared_experts=self.shared_experts`), and
+    # (2) applies `routed_scaling_factor` to the fused output
+    # (`apply_routed_scale_to_output=True`). `forward_oot` is dead code here.
+    #
+    # Re-adding shared experts and re-scaling on top of that -- as the old body
+    # did -- double-counts the shared experts and mis-scales the sum, producing
+    # confidently-wrong (NaN-free) logits. Defer entirely to the upstream
+    # DeepseekV2MoE.forward, which does the right thing exactly once.
+    return _upstream_deepseek_v2_moe_forward(self, hidden_states)
 
 
 def __deepseek_v2_attention_forward(

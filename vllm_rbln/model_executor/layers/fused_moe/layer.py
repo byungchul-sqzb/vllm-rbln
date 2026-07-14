@@ -20,11 +20,38 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.layers.fused_moe.runner.moe_runner import (
+    MoERunner,
+    _moe_forward,
+    _moe_forward_shared,
+)
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _rbln_moe_select_forward(self):
+    """Use the unwrapped MoE forward functions instead of the opaque
+    ``torch.ops.vllm.moe_forward{,_shared}`` custom ops.
+
+    On RBLN the traced decode graph is lowered by rebel-compiler (not
+    Inductor), which cannot lower the opaque MoE custom op -- with it in the
+    graph, decode compile fails ("moe_forward_shared not implemented") and
+    silently falls back to CPU eager, losing NPU acceleration. Calling
+    ``_forward_impl`` directly (via the raw module-level functions) lets the
+    MoE decompose into primitive ops rebel-compiler can lower. Upstream
+    already does exactly this for CPU/TPU in ``MoERunner._select_forward``;
+    the opaque-op path is only load-bearing for the MoE-LoRA dual-stream path,
+    which the RBLN Unlimited-OCR runtime does not use.
+    """
+    return _moe_forward if self._shared_experts is None else _moe_forward_shared
+
+
+# Applied at import (register_ops) time, before any MoERunner is constructed
+# during model build, so every runner picks up the unwrapped entry.
+MoERunner._select_forward = _rbln_moe_select_forward
 
 
 fused_moe_upstream__init__ = FusedMoE.__init__
@@ -33,13 +60,21 @@ fused_moe_upstream__init__ = FusedMoE.__init__
 def fused_moe_custom__init__(self, *args, **kwargs):
     fused_moe_upstream__init__(self, *args, **kwargs)
 
+    # RBLN overrides the fused expert kernel only.  vLLM's overlapped shared-
+    # expert path expects FusedMoE.forward to return ``(shared_out, fused_out)``,
+    # while this backend returns the fused routed-expert tensor.  Disable the
+    # overlap optimization so SharedFusedMoE computes shared experts in the
+    # standard path and adds them with the routed output, preserving semantics.
+    if getattr(self, "_shared_experts", None) is not None:
+        self.use_overlapped = False
+
     self.expert_map_const = (
         self.expert_map.tolist() if self.expert_map is not None else None
     )
 
 
 # Define custom_moe_glu op based on environment variable
-# VLLM_RBLN_MOE_USE_OPT_KERNEL: uses topk, post_norm, expert_map parameters
+# VLLM_RBLN_MOE_USE_OPT_KERNEL: uses pre-masked routing weights + hidden_act
 # VLLM_RBLN_MOE_CUSTOM_KERNEL: uses expert_select_count parameter
 if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
 
@@ -53,36 +88,42 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
-        scoring_func: str,
-        topk: int,
-        post_norm: bool,
+        hidden_act: str,
         expert_map: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
-        dp_mask: torch.Tensor | None = None,
+        n_group: int | None = None,
+        topk_group: int | None = None,
     ) -> torch.Tensor:
-        """
-        Customized MoE GLU operation (optimized kernel version).
+        """RBLN compiler-compatible optimized MoE GLU custom op.
 
-        Expected tensor shapes:
-        - hidden_states: [batch * seq_len, hidden_size]
-        - gate_proj_weight: [num_experts, intermediate_size, hidden_size]
-        - up_proj_weight: [num_experts, intermediate_size, hidden_size]
-        - down_proj_weight: [num_experts, hidden_size, intermediate_size]
-        - masked_routing_weight: [batch * seq_len, num_experts]
-
-        Returns:
-            torch.Tensor: [batch * seq_len, hidden_size]
+        The installed RBLN converter expects routing to be computed externally
+        and passed as experts-first ``masked_routing_weight`` with shape
+        ``[num_experts_global, num_tokens]``.
         """
+        if hidden_act.lower() not in {"silu", "swish"} and "gelu" not in hidden_act.lower():
+            raise ValueError(f"Unsupported hidden_act={hidden_act!r}")
+        if gate_proj_bias is not None or up_proj_bias is not None or down_proj_bias is not None:
+            raise ValueError("Biased MoE GLU is not supported by this RBLN path")
+        del n_group, topk_group
+
+        valid_weight = masked_routing_weight.to(torch.float32)
+        if expert_map is not None:
+            global_indices = torch.nonzero(expert_map >= 0).flatten()
+            valid_weight = valid_weight[global_indices, :]
+
         out = torch.zeros_like(hidden_states)
         expert_cnt = gate_proj_weight.shape[0]
         for i in range(expert_cnt):
             gate = torch.nn.functional.linear(hidden_states, gate_proj_weight[i])
             up = torch.nn.functional.linear(hidden_states, up_proj_weight[i])
-            mul = torch.nn.functional.silu(gate) * up
+            if "gelu" in hidden_act.lower():
+                mul = torch.nn.functional.gelu(gate) * up
+            else:
+                mul = torch.nn.functional.silu(gate) * up
             down = torch.nn.functional.linear(mul, down_proj_weight[i])
-            out += down * masked_routing_weight[:, i : i + 1]
+            out += down * valid_weight[i].unsqueeze(-1).to(down.dtype)
         return out
 
     @custom_moe_glu.register_fake
@@ -92,14 +133,13 @@ if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
         up_proj_weight: torch.Tensor,
         down_proj_weight: torch.Tensor,
         masked_routing_weight: torch.Tensor,
-        scoring_func: str,
-        topk: int,
-        post_norm: bool,
+        hidden_act: str,
         expert_map: torch.Tensor | None = None,
         gate_proj_bias: torch.Tensor | None = None,
         up_proj_bias: torch.Tensor | None = None,
         down_proj_bias: torch.Tensor | None = None,
-        dp_mask: torch.Tensor | None = None,
+        n_group: int | None = None,
+        topk_group: int | None = None,
     ) -> torch.Tensor:
         return torch.empty_like(hidden_states)
 
@@ -166,6 +206,7 @@ def unquantized_fused_moe_method_rbln(
     layer: FusedMoE,
     x: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None = None,
 ):
     # selected_experts
     w1 = layer.w13_weight
@@ -244,7 +285,16 @@ def unquantized_fused_moe_method_rbln(
 
 
 def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
-    num_tokens_across_dp = get_forward_context().dp_metadata.num_tokens_across_dp_cpu
+    dp_metadata = get_forward_context().dp_metadata
+    if dp_metadata is None:
+        # Standalone/eager single-DP probes do not populate DP metadata.
+        # In that case every local token is valid, so the mask is all-left.
+        tokens_mask = torch.full((num_tokens, 1), left, dtype=torch.float32)
+        if device is not None:
+            tokens_mask = tokens_mask.to(device)
+        return tokens_mask
+
+    num_tokens_across_dp = dp_metadata.num_tokens_across_dp_cpu
     num_tokens_across_dp = num_tokens_across_dp.unsqueeze(1)
     if num_tokens_across_dp.size(0) == 1:
         max_pad = num_tokens
@@ -261,19 +311,34 @@ def get_tokens_mask(num_tokens: int, left=1.0, right=0.0, device=None):
 
 
 # based on custom fused moe expert kernel
-def get_masked_routing_weights(router_logits, top_k, renormalize, expert_map):
+def get_masked_routing_weights(
+    router_logits, top_k, renormalize, expert_map, scoring_func="softmax"
+):
     # routing_weights: (batch * sequence_length, n_experts)
     # selected_experts: (batch * sequence_length, top_k)
-    if renormalize:
-        router_logits = router_logits.to(torch.float)
-        selected_weights, selected_experts = torch.topk(router_logits, k=top_k, dim=-1)
-        selected_weights = torch.nn.functional.softmax(selected_weights, dim=1)
-    else:
-        routing_weights = torch.nn.functional.softmax(router_logits, dim=1)
-        routing_weights = routing_weights.to(torch.float)
+    router_logits = router_logits.to(torch.float)
+    if scoring_func == "softmax":
+        if renormalize:
+            selected_weights, selected_experts = torch.topk(
+                router_logits, k=top_k, dim=-1
+            )
+            selected_weights = torch.nn.functional.softmax(selected_weights, dim=1)
+        else:
+            routing_weights = torch.nn.functional.softmax(router_logits, dim=1)
+            selected_weights, selected_experts = torch.topk(
+                routing_weights, k=top_k, dim=-1
+            )
+    elif scoring_func == "sigmoid":
+        routing_weights = router_logits.sigmoid()
         selected_weights, selected_experts = torch.topk(
             routing_weights, k=top_k, dim=-1
         )
+        if renormalize:
+            selected_weights = selected_weights / (
+                selected_weights.sum(dim=-1, keepdim=True) + 1e-20
+            )
+    else:
+        raise ValueError(f"Unsupported MoE scoring_func={scoring_func!r}")
 
     use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
     if use_moe_tokens_mask:
@@ -318,6 +383,7 @@ def unquantized_fused_moe_method_custom(
     layer: FusedMoE,
     x: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None = None,
 ):
     # selected_experts
     # w1 : gate_proj, w2 : down_proj, w3 : up_proj
@@ -330,16 +396,20 @@ def unquantized_fused_moe_method_custom(
     # gate_proj_weight - first half, layer.w13_weight[:intermediate_size]
     # up_proj_weight - second half, layer.w13_weight[intermediate_size:]
     # down_proj_weights = layer.w2_weight
-    gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
-    up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
-    down_proj_weight = layer.w2_weight
+    gate_proj_weight = layer.w13_weight[:, :intermediate_size, :].contiguous()
+    up_proj_weight = layer.w13_weight[:, intermediate_size:, :].contiguous()
+    down_proj_weight = layer.w2_weight.contiguous()
 
     # expected tensor shape - [num_tokens, -1]
     hidden_states = x.reshape(num_tokens, -1)
     router_logits = router_logits.reshape(num_tokens, -1)
 
     masked_routing_weights, expert_select_count = get_masked_routing_weights(
-        router_logits, layer.top_k, layer.renormalize, layer.expert_map
+        router_logits,
+        layer.top_k,
+        layer.renormalize,
+        layer.expert_map,
+        getattr(layer, "scoring_func", "softmax"),
     )
 
     tokens_mask = None
@@ -367,6 +437,7 @@ def unquantized_fused_optimize_moe_method_custom(
     layer: FusedMoE,
     x: torch.Tensor,
     router_logits: torch.Tensor,
+    input_ids: torch.Tensor | None = None,
 ):
     # selected_experts
     # w1 : gate_proj, w2 : down_proj, w3 : up_proj
@@ -379,62 +450,54 @@ def unquantized_fused_optimize_moe_method_custom(
     # gate_proj_weight - first half, layer.w13_weight[:intermediate_size]
     # up_proj_weight - second half, layer.w13_weight[intermediate_size:]
     # down_proj_weights = layer.w2_weight
-    gate_proj_weight = layer.w13_weight[:, :intermediate_size, :]
-    up_proj_weight = layer.w13_weight[:, intermediate_size:, :]
-    down_proj_weight = layer.w2_weight
+    gate_proj_weight = layer.w13_weight[:, :intermediate_size, :].contiguous()
+    up_proj_weight = layer.w13_weight[:, intermediate_size:, :].contiguous()
+    down_proj_weight = layer.w2_weight.contiguous()
 
     # expected tensor shape - [num_tokens, -1]
     hidden_states = x.reshape(num_tokens, -1)
     router_logits = router_logits.reshape(num_tokens, -1)
 
-    # Pre-score routing inputs at caller side; compiler custom op routing
-    # expects already-scored values (no sigmoid applied inside the kernel).
-    scoring_func = getattr(layer, "scoring_func", None)
-    assert scoring_func is not None, "FusedMoE.scoring_func must be set"
-    assert scoring_func in {"softmax", "sigmoid"}
-    if scoring_func == "sigmoid":
-        router_logits = torch.sigmoid(router_logits.to(torch.float32)).to(
-            router_logits.dtype
-        )
+    masked_routing_weights, _expert_select_count = get_masked_routing_weights(
+        router_logits,
+        layer.top_k,
+        layer.renormalize,
+        layer.expert_map,
+        getattr(layer, "scoring_func", "softmax"),
+    )
+    # RBLN custom_moe_glu lowering expects experts-first routing layout.
+    masked_routing_weights = masked_routing_weights.transpose(0, 1).contiguous()
 
-    expert_map_const = None
-    if layer.expert_map is not None:
-        assert getattr(layer, "expert_map_const", None) is not None
-        # Keep tensor ops only: .tolist() + torch.tensor(list) graph-breaks under
-        # PyTorch 2.10+ Dynamo when capture_scalar_outputs is false (pytorch#163807).
-        expert_map_const = torch.tensor(layer.expert_map_const, dtype=torch.int32)
-
-    tokens_mask = None
-    use_moe_tokens_mask = envs.VLLM_RBLN_USE_MOE_TOKENS_MASK
-    if use_moe_tokens_mask:
-        tokens_mask = get_tokens_mask(num_tokens, device=router_logits.device)
-
-    # optimum-rbln/src/optimum/rbln/transformers/models/qwen3_moe/
-    # qwen3_moe_architecture.py
-    # Keep argument order aligned with rebel custom_op schema:
-    # (..., router_logits, scoring_func, topk, post_norm, ...)
     final_hidden_states = torch.ops.rbln_custom_ops.custom_moe_glu(
         hidden_states,
         gate_proj_weight,
         up_proj_weight,
         down_proj_weight,
-        router_logits,
-        scoring_func,
-        layer.top_k,
-        layer.renormalize,
-        expert_map_const,
+        masked_routing_weights,
+        "silu",
+        layer.expert_map,
         None,
         None,
         None,
-        tokens_mask,
+        None,
+        None,
     )
     return final_hidden_states.reshape(orig_shape)
 
 
 def fused_moe_forward_rbln(
-    self: FusedMoE, hidden_states: torch.Tensor, router: torch.nn.Module
+    self: FusedMoE,
+    hidden_states: torch.Tensor,
+    router: torch.nn.Module | None = None,
+    router_logits: torch.Tensor | None = None,
+    **_kwargs,
 ) -> torch.Tensor:
     assert self.quant_method is not None
+
+    if router_logits is None:
+        if router is None:
+            raise TypeError("FusedMoE RBLN forward requires router or router_logits")
+        router_logits = router(hidden_states)
 
     if self.moe_parallel_config.dp_size > 1:
         org_hidden_shape = hidden_states.shape
@@ -452,7 +515,6 @@ def fused_moe_forward_rbln(
         # 5. select each DP rank output
         # 6. to_group all reduce - {0+2+1+3}, {0+2+1+3}, {0+2+1+3}, {0+2+1+3}
         hidden_states = self.naive_multicast(hidden_states)
-    router_logits = router(hidden_states)
 
     # Matrix multiply.
     final_hidden_states = self.quant_method.apply(
@@ -525,16 +587,45 @@ def fused_moe_naive_multicast_rbln(self: FusedMoE, x: torch.Tensor):
         return all_gather_buffer
 
 
+def _unquantized_fused_moe_method_is_monolithic_rbln(self) -> bool:
+    # Upstream's is_monolithic falls back to
+    # `self.experts_cls.is_monolithic()` when `self.moe_kernel` is still
+    # unset, but out-of-tree backends (RBLN included) get `experts_cls=None`
+    # from `select_unquantized_moe_backend` (see
+    # fused_moe/oracle/unquantized.py), so that call raises AttributeError
+    # on None -- which Python's property-getter-swallows-AttributeError
+    # behavior then misreports as "no attribute 'is_monolithic'" entirely.
+    # RBLN's kernels (below) compute routing internally from router_logits
+    # in one call -- the "monolithic" calling convention -- so report True
+    # here (and route through `.apply_monolithic()`, which RBLN overrides
+    # below) rather than falling through to the experts_cls-based upstream
+    # logic.
+    if self.moe_kernel is None and self.experts_cls is None:
+        return True
+    return _upstream_is_monolithic.__get__(self)
+
+
+_upstream_is_monolithic = UnquantizedFusedMoEMethod.is_monolithic
+
 FusedMoE.__init__ = fused_moe_custom__init__
 FusedMoE.forward_oot = fused_moe_forward_rbln
+UnquantizedFusedMoEMethod.is_monolithic = property(
+    _unquantized_fused_moe_method_is_monolithic_rbln
+)
 
+
+# NOTE(RBLN): these kernels compute routing internally from router_logits in
+# one call (the "monolithic" convention: layer, x, router_logits, input_ids),
+# not the topk_weights/topk_ids-precomputed `.apply()` convention -- wire
+# them to apply_monolithic (dispatched to when is_monolithic is True, see
+# above), not apply.
 if envs.VLLM_RBLN_MOE_USE_OPT_KERNEL:
     logger.info("[RBLN] fused moe, RBLN optimize moe custom kernel")
-    UnquantizedFusedMoEMethod.apply = unquantized_fused_optimize_moe_method_custom
+    UnquantizedFusedMoEMethod.apply_monolithic = unquantized_fused_optimize_moe_method_custom
 elif envs.VLLM_RBLN_MOE_CUSTOM_KERNEL:
     logger.info("[RBLN] fused moe, RBLN moe custom kernel")
-    UnquantizedFusedMoEMethod.apply = unquantized_fused_moe_method_custom
+    UnquantizedFusedMoEMethod.apply_monolithic = unquantized_fused_moe_method_custom
 else:
     logger.info("[RBLN] fused moe, pytorch native kernel")
-    UnquantizedFusedMoEMethod.apply = unquantized_fused_moe_method_rbln
+    UnquantizedFusedMoEMethod.apply_monolithic = unquantized_fused_moe_method_rbln
 FusedMoE.naive_multicast = fused_moe_naive_multicast_rbln

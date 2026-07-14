@@ -105,7 +105,6 @@ class RBLNDPMetadata(DPMetadata):
             num_tokens_across_dp_cpu = num_tokens_across_dp
             max_pad = num_padded_tokens
 
-            max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp_cpu)
             max_pads_across_dp = torch.empty(max_pad, device="cpu")
         else:
             assert num_tokens_across_dp is None, (
@@ -117,12 +116,14 @@ class RBLNDPMetadata(DPMetadata):
             num_tokens_across_dp_cpu = torch.tensor(
                 [num_tokens], device="cpu", dtype=torch.int32
             )
-            max_tokens_across_dp_cpu = num_tokens
             max_pads_across_dp = None
 
+        # NOTE(RBLN): construct with keyword args -- DPMetadata's base field
+        # order isn't a stable contract across vLLM versions, and passing
+        # positionally here previously misaligned num_tokens_across_dp_cpu
+        # into DPMetadata.local_sizes after an upstream field reorder.
         return RBLNDPMetadata(
-            max_tokens_across_dp_cpu,
-            num_tokens_across_dp_cpu,
+            num_tokens_across_dp_cpu=num_tokens_across_dp_cpu,
             max_pads_across_dp=max_pads_across_dp,
         )
 
@@ -137,6 +138,7 @@ def _set_forward_context(
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
     batch_descriptor: BatchDescriptor | None = None,
     ubatch_slices: UBatchSlices | None = None,
+    slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     num_padded_tokens: int | None = None,
     additional_kwargs: dict[str, Any] | None = None,
 ):
@@ -161,14 +163,21 @@ def _set_forward_context(
             num_padded_tokens,
         )
 
+    # NOTE(RBLN): vLLM removed `virtual_engine` from create_forward_context's
+    # signature (pipeline-parallel virtual engines are tracked elsewhere
+    # now); it's accepted here only for caller backward-compatibility and
+    # is intentionally not forwarded. Pass everything else by keyword so a
+    # future upstream signature reorder can't silently misalign positional
+    # args again.
+    del virtual_engine
     forward_context = create_forward_context(
-        attn_metadata,
-        vllm_config,
-        virtual_engine,
-        dp_metadata,
-        cudagraph_runtime_mode,
-        batch_descriptor,
-        ubatch_slices,
+        attn_metadata=attn_metadata,
+        vllm_config=vllm_config,
+        dp_metadata=dp_metadata,
+        cudagraph_runtime_mode=cudagraph_runtime_mode,
+        batch_descriptor=batch_descriptor,
+        ubatch_slices=ubatch_slices,
+        slot_mapping=slot_mapping,
     )
     if additional_kwargs:
         existing_additional_kwargs = getattr(forward_context, "additional_kwargs", None)

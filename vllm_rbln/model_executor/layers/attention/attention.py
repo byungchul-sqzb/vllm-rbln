@@ -28,7 +28,13 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheSpec
 
 from vllm_rbln.v1.attention.kv_cache_bindings import materialize_kv_cache_view
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.attention.prefill_aware_swa import (
+    detect_prefill_aware_swa_status_from_vllm_config,
+)
+from vllm_rbln.v1.kv_cache import (
+    RBLNPrefillAwareSlidingWindowSpec,
+    RBLNSlidingWindowSpec,
+)
 
 # ---------------------------------------------------------------------------
 # Snapshots of upstream implementations (used by RBLN overrides)
@@ -53,7 +59,9 @@ def _rbln_attention_init(self, *args, **kwargs) -> None:
         self.layer_index -= start
 
 
-def _resolve_kv_cache(attn_metadata, layer_index: int) -> torch.Tensor:
+def _resolve_kv_cache(
+    attn_metadata, layer_index: int, embedded_kv_cache: torch.Tensor | None = None
+) -> torch.Tensor:
     """Resolve the KV cache for a given layer, either from deduplicated
     base tensors (for torch.export compatibility) or from the direct list."""
     kv_cache_view_infos = getattr(attn_metadata, "kv_cache_view_infos", None)
@@ -65,6 +73,9 @@ def _resolve_kv_cache(attn_metadata, layer_index: int) -> torch.Tensor:
         return materialize_kv_cache_view(
             kv_cache_bases, kv_cache_view_infos[layer_index]
         )
+
+    if embedded_kv_cache is not None:
+        return embedded_kv_cache
 
     assert attn_metadata.kv_caches is not None
     assert layer_index < len(attn_metadata.kv_caches)
@@ -84,7 +95,7 @@ def _rbln_unified_attention(
     # kv cache (self.kv_cache); use attention metadata's kv cache.
     # attention metadata's kv cache must equal the attention layer's
     # embedded kv cache.
-    kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
+    kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index, _kv_cache)
 
     output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
     return output
@@ -111,8 +122,8 @@ def _rbln_unified_attention_with_output(
     # kv cache (self.kv_cache); use attention metadata's kv cache.
     # attention metadata's kv cache must equal the attention layer's
     # embedded kv cache.
-    kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index)
-    self.impl.forward(
+    kv_cache = _resolve_kv_cache(attn_metadata, self.layer_index, _kv_cache)
+    result = self.impl.forward(
         self,
         query,
         key,
@@ -123,6 +134,16 @@ def _rbln_unified_attention_with_output(
         output_scale=output_scale,
         output_block_scale=output_block_scale,
     )
+    # vLLM's Attention.forward now allocates `output` with torch.empty()
+    # (uninitialized) and treats unified_attention_with_output as a
+    # side-effecting op that must fill it in place -- it ignores the return
+    # value and hands `output` straight back to the caller. RBLNFlashAttentionImpl
+    # (like most attention impls) still *returns* its result instead of writing
+    # `output`, so without this copy vLLM would propagate the uninitialized
+    # buffer downstream: garbage/NaN that varies run-to-run. Mirror the result
+    # into `output` when the impl didn't already write it.
+    if output is not None and result is not None and result is not output:
+        output.copy_(result.reshape(output.shape))
 
 
 def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
@@ -130,6 +151,34 @@ def _rbln_get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
     block_size = vllm_config.cache_config.block_size
     # Should not be called for enc-dec or encoder-only attention.
     assert self.attn_type == AttentionType.DECODER
+
+    pa_swa_status = detect_prefill_aware_swa_status_from_vllm_config(vllm_config)
+    if pa_swa_status.required:
+        sliding_window = pa_swa_status.sliding_window
+        if sliding_window is None:
+            raise NotImplementedError(
+                "RBLN PA-SWA is required but the checkpoint/config does not "
+                "expose sliding_window_size/sliding_window."
+            )
+        if not pa_swa_status.backend_ready:
+            raise NotImplementedError(
+                "RBLN PA-SWA backend is not ready. Refusing to create a "
+                "FullAttentionSpec or regular RBLNSlidingWindowSpec because "
+                "Unlimited-OCR decode requires all prefill KV plus the latest "
+                "checkpoint-derived sliding-window decode KV."
+            )
+        assert not vllm_config.model_config.use_mla, (
+            "MLA is not supported for PA-SWA slidingwindow"
+        )
+        return RBLNPrefillAwareSlidingWindowSpec(
+            block_size=block_size,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+            head_size_v=self.head_size_v,
+            dtype=self.kv_cache_torch_dtype,
+            sliding_window=sliding_window,
+        )
+
     if self.sliding_window is not None:
         assert not vllm_config.model_config.use_mla, (
             "MLA is not supported for slidingwindow"

@@ -64,6 +64,7 @@ from vllm.utils.torch_utils import get_dtype_size, kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.backend import AttentionBackend, AttentionType, MultipleOf
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
+    PAD_SLOT_ID,
     CommonAttentionMetadata,
     create_fast_prefill_custom_backend,
 )
@@ -116,6 +117,7 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
+    sanity_check_mm_encoder_outputs,
 )
 
 import vllm_rbln.rbln_envs as envs
@@ -138,7 +140,10 @@ from vllm_rbln.v1.attention.kv_cache_bindings import (
     build_kv_cache_forward_context_kwargs,
     validate_shared_attention_kv_cache_contiguity,
 )
-from vllm_rbln.v1.kv_cache import RBLNSlidingWindowSpec
+from vllm_rbln.v1.kv_cache import (
+    RBLNPrefillAwareSlidingWindowSpec,
+    RBLNSlidingWindowSpec,
+)
 from vllm_rbln.v1.sample import RBLNSampler
 from vllm_rbln.v1.sample.rbln_rejection_sampler import RBLNRejectionSampler
 from vllm_rbln.v1.spec_decode.eagle import RBLNEagleProposer
@@ -152,6 +157,63 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput
 
 logger = init_logger(__name__)
+
+
+def _rbln_cpu_compute_slot_mapping(
+    self, num_reqs: int, query_start_loc: torch.Tensor, positions: torch.Tensor
+) -> None:
+    """CPU replacement for vLLM 0.22's Triton ``_compute_slot_mapping_kernel``.
+
+    vLLM 0.22 moved slot-mapping computation into a ``@triton.jit`` kernel that
+    writes ``slot_mapping.gpu`` directly (and dropped ``commit_slot_mapping``).
+    RBLN has no Triton driver, so replicate the kernel in plain torch. RBLN runs
+    with CP/DCP world size 1 and interleave 1, but the full CP formula is cheap
+    so mirror it exactly to stay correct if those are ever enabled.
+    """
+    num_tokens = int(positions.shape[0])
+    sm = self.slot_mapping.gpu
+    device = sm.device
+    qsl = query_start_loc[: num_reqs + 1].to(device=device, dtype=torch.int64)
+    pos = positions[:num_tokens].to(device=device, dtype=torch.int64)
+    counts = qsl[1:] - qsl[:-1]
+    req_of_token = torch.repeat_interleave(
+        torch.arange(num_reqs, device=device, dtype=torch.int64), counts
+    )
+
+    total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+    total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+    interleave = self.cp_kv_cache_interleave_size
+    block_size = self.block_size
+    virtual_block_size = block_size * total_cp_world_size
+
+    block_indices = pos // virtual_block_size
+    block_numbers = self.block_table.gpu.to(torch.int64)[req_of_token, block_indices]
+    virtual_block_offsets = pos - block_indices * virtual_block_size
+    is_local = (virtual_block_offsets // interleave) % total_cp_world_size == (
+        total_cp_rank
+    )
+    local_block_offsets = (
+        virtual_block_offsets // (total_cp_world_size * interleave)
+    ) * interleave + (virtual_block_offsets % interleave)
+    slots = block_numbers * block_size + local_block_offsets
+    slots = torch.where(is_local, slots, torch.full_like(slots, PAD_SLOT_ID))
+
+    sm[:num_tokens] = slots
+    sm[num_tokens : self.max_num_batched_tokens] = PAD_SLOT_ID
+
+
+def _install_rbln_cpu_slot_mapping() -> None:
+    """Patch BlockTable.compute_slot_mapping to the CPU implementation and drop
+    the removed commit step. Idempotent."""
+    from vllm.v1.worker.block_table import BlockTable
+
+    if getattr(BlockTable, "_rbln_cpu_slot_mapping_installed", False):
+        return
+    BlockTable.compute_slot_mapping = _rbln_cpu_compute_slot_mapping
+    BlockTable._rbln_cpu_slot_mapping_installed = True
+
+
+_install_rbln_cpu_slot_mapping()
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -411,7 +473,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[self.cache_config.block_size],
             kernel_block_sizes=[self.cache_config.block_size],
-            is_spec_decode=bool(self.vllm_config.speculative_config),
+            # vLLM 0.22 replaced InputBatch's is_spec_decode flag with
+            # num_spec_tokens; RBLN Unlimited-OCR doesn't use spec decode.
+            num_spec_tokens=(
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config is not None
+                else 0
+            ),
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
@@ -505,8 +573,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         self.mm_budget = (
             MultiModalBudget(
-                self.model_config,
-                self.scheduler_config,
+                self.vllm_config,
                 self.mm_registry,
             )
             if self.supports_mm_inputs
@@ -1229,8 +1296,18 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=self.input_ids.cpu[:total_num_scheduled_tokens],
         )
 
-        self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        # vLLM 0.22 changed compute_slot_mapping to (num_reqs, query_start_loc,
+        # positions) and removed commit_slot_mapping (the Triton kernel writes
+        # slot_mapping.gpu directly; RBLN uses a torch CPU replacement, see
+        # _rbln_cpu_compute_slot_mapping).
+        _qsl_np = np.empty(num_reqs + 1, dtype=np.int32)
+        _qsl_np[0] = 0
+        _qsl_np[1:] = cu_num_tokens
+        self.input_batch.block_table.compute_slot_mapping(
+            num_reqs,
+            torch.from_numpy(_qsl_np),
+            torch.from_numpy(positions_np),
+        )
 
         # Prepare the attention metadata.
         self.query_start_loc.np[0] = 0
@@ -1500,6 +1577,52 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             options=copy(options),
             dynamic=False,
         )
+
+        # WORKAROUND(RBLN v0.11): rebel-compiler 0.11 segfaults in
+        # rbln::RblnBuildModule::BuildRelay when handed the *monolithic* full
+        # DeepseekV2 prefill graph (whole 12-layer MoE model as one graph). The
+        # same compiler lowers the model's individual decoder layers fine. When
+        # VLLM_RBLN_COMPILE_REGIONAL=1, compile each decoder layer as its own
+        # (smaller) graph and run the top-level model forward eagerly to
+        # orchestrate them -- "regional"/piecewise compilation -- so no single
+        # graph is large enough to trip the compiler crash.
+        if os.environ.get("VLLM_RBLN_COMPILE_REGIONAL", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            # NOTE(RBLN v0.11 workaround, partial): regional per-layer compile
+            # gets past the monolithic-graph segfault, but the per-layer PREFILL
+            # graph still is not compilable by rebel-compiler 0.11 -- it fails in
+            # one of two ways that are two faces of the same SDK-level inability
+            # to build the MoE+attention prefill graph:
+            #   * as-is: DEVICE_GRAPH_CONVERSION -- the layer's returned
+            #     `residual` (threaded in and out) is an on-device dlf16 tensor
+            #     marked dev_tensor_type=["input","output"], clashing with the
+            #     compiled fn's host/bf16 result signature;
+            #   * cloning the returned tensors to break that input/output
+            #     aliasing removes the dtype error but re-triggers the native
+            #     BuildRelay segfault.
+            # Python-level graph manipulation only shifts between those two
+            # failure modes; the fix is SDK-owned (Rebellions). See
+            # docs/V011_STANDARD_RUNTIME_PORT.md. Shipping path stays the custom
+            # runtime (eager prefill + compiled decode, verified 10/10).
+            num_compiled = 0
+            for module in self.model.modules():
+                if type(module).__name__.endswith("DecoderLayer"):
+                    module.forward = torch.compile(
+                        module.forward,
+                        backend=logged_rbln_backend,
+                        options=copy(options),
+                        dynamic=False,
+                    )
+                    num_compiled += 1
+            logger.info(
+                "[RBLN] regional compile: compiled %d decoder layers "
+                "individually (top-level model runs eager).",
+                num_compiled,
+            )
+            return model
 
         compiled_model = torch.compile(
             model,
@@ -1772,6 +1895,132 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             kv_connector_output=kv_connector_output,
         )
 
+    def _extract_mm_kwargs(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> dict[str, Any]:
+        """Port of GPUModelRunner._extract_mm_kwargs.
+
+        Only used by "raw input" multimodal models that consume pixel
+        tensors directly in forward() instead of precomputed encoder
+        embeddings; Unlimited-OCR goes through the encoder + embedding-merge
+        path (_execute_mm_encoder/_gather_mm_embeddings) instead, so this
+        returns {} for it, matching upstream behavior for that model class.
+        """
+
+        if not scheduler_output or not self.is_multimodal_raw_input_only_model:
+            return {}
+
+        from vllm.multimodal.utils import group_and_batch_mm_kwargs
+
+        mm_kwargs: list[tuple[str, Any]] = []
+        for req in scheduler_output.scheduled_new_reqs:
+            for feature in req.mm_features:
+                if feature.data is not None:
+                    mm_kwargs.append((feature.modality, feature.data))
+
+        mm_kwargs_combined: dict[str, Any] = {}
+        for _modality, _num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs, device=self.device, pin_memory=self.pin_memory
+        ):
+            mm_kwargs_combined.update(mm_kwargs_batch)
+        return mm_kwargs_combined
+
+    def _execute_mm_encoder(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[torch.Tensor]:
+        """Run the multimodal encoder for newly scheduled encoder inputs.
+
+        Minimal-scope port of GPUModelRunner._execute_mm_encoder, covering
+        only what the validated single-request/single-partition RBLN serving
+        envelope needs: no LoRA, no encoder-token pruning. Multi-request
+        batching across differing modalities is not specially reordered
+        (matches upstream behavior for the common single-modality case).
+        """
+
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        if not scheduled_encoder_inputs:
+            return []
+
+        from vllm.multimodal.utils import group_and_batch_mm_kwargs
+
+        mm_hashes: list[str] = []
+        mm_kwargs: list[tuple[str, Any]] = []
+        for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
+            req_state = self.requests[req_id]
+            for mm_input_id in encoder_input_ids:
+                mm_feature = req_state.mm_features[mm_input_id]
+                if mm_feature.data is None:
+                    continue
+                mm_hashes.append(mm_feature.identifier)
+                mm_kwargs.append((mm_feature.modality, mm_feature.data))
+
+        if not mm_kwargs:
+            return []
+
+        encoder_outputs: list[torch.Tensor] = []
+        for _modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
+            mm_kwargs, device=self.device, pin_memory=self.pin_memory
+        ):
+            batch_outputs = self.model.embed_multimodal(**mm_kwargs_batch)
+            sanity_check_mm_encoder_outputs(batch_outputs, expected_num_items=num_items)
+            encoder_outputs.extend(batch_outputs)
+
+        for mm_hash, output in zip(mm_hashes, encoder_outputs):
+            self.encoder_cache[mm_hash] = output
+
+        return encoder_outputs
+
+    def _gather_mm_embeddings(
+        self, scheduler_output: "SchedulerOutput", shift_computed_tokens: int = 0
+    ) -> tuple[list[torch.Tensor], torch.Tensor]:
+        """Gather cached encoder outputs for the current step's tokens.
+
+        Minimal-scope port of GPUModelRunner._gather_mm_embeddings: assumes
+        each multimodal item is fully contained within a single scheduling
+        step (true for the validated single-request envelope, where chunked
+        prefill is sized to cover the whole prompt), so it returns the full
+        cached encoder output for every scheduled mm item rather than
+        computing a partial-overlap slice.
+        """
+
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        is_multimodal = torch.zeros(
+            total_num_scheduled_tokens, dtype=torch.bool, device=self.device
+        )
+        mm_embeds: list[torch.Tensor] = []
+        req_start_idx = 0
+        for req_id in self.input_batch.req_ids:
+            num_scheduled_tokens = scheduler_output.num_scheduled_tokens.get(req_id, 0)
+            if num_scheduled_tokens > 0:
+                req_state = self.requests[req_id]
+                num_computed_tokens = (
+                    req_state.num_computed_tokens + shift_computed_tokens
+                )
+                for mm_feature in req_state.mm_features:
+                    pos_info = mm_feature.mm_position
+                    start_pos = pos_info.offset
+                    num_encoder_tokens = pos_info.length
+                    if start_pos >= num_computed_tokens + num_scheduled_tokens:
+                        break
+                    if start_pos + num_encoder_tokens <= num_computed_tokens:
+                        continue
+                    mm_hash = mm_feature.identifier
+                    encoder_output = self.encoder_cache.get(mm_hash)
+                    assert encoder_output is not None, (
+                        f"Encoder cache miss for {mm_hash}."
+                    )
+                    mm_embeds.append(encoder_output)
+                    local_start = req_start_idx + max(
+                        start_pos - num_computed_tokens, 0
+                    )
+                    local_end = req_start_idx + min(
+                        start_pos + num_encoder_tokens - num_computed_tokens,
+                        num_scheduled_tokens,
+                    )
+                    is_multimodal[local_start:local_end] = True
+            req_start_idx += num_scheduled_tokens
+        return mm_embeds, is_multimodal
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1796,20 +2045,28 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         ):
             # Run the multimodal encoder if any.
             self._execute_mm_encoder(scheduler_output)
-            mm_embeds = self._gather_mm_embeddings(scheduler_output)
+            mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds_scheduled = self.model.get_input_embeddings(
+            inputs_embeds_scheduled = self.model.embed_input_ids(
                 input_ids=self.input_ids.gpu[:num_scheduled_tokens],
                 multimodal_embeddings=mm_embeds or None,
+                is_multimodal=is_mm_embed,
             )
 
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
 
-            input_ids = None
+            # NOTE(RBLN): unlike upstream GPUModelRunner, RBLNModelRunner's
+            # execute_model asserts `input_ids is not None` and uses it for
+            # RBLN-specific shape/slot-mapping bookkeeping downstream. Keep
+            # the real token ids (rather than nulling them out) alongside
+            # inputs_embeds; DeepseekV2Model.forward prioritizes inputs_embeds
+            # unconditionally when it is not None, so input_ids has no effect
+            # on the computed hidden states here.
+            input_ids = self.input_ids.gpu[:num_input_tokens]
             inputs_embeds = self.inputs_embeds.gpu[:num_input_tokens]
             model_kwargs = {
                 **self._init_model_kwargs(num_scheduled_tokens),
@@ -2281,8 +2538,16 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             out=input_ids[:total_num_scheduled_tokens],
         )
 
-        input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
-        input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+        # vLLM 0.22 compute_slot_mapping signature/commit change (see the other
+        # call site + _rbln_cpu_compute_slot_mapping).
+        _qsl_np = np.empty(num_reqs + 1, dtype=np.int32)
+        _qsl_np[0] = 0
+        _qsl_np[1:] = cu_num_tokens
+        input_batch.block_table.compute_slot_mapping(
+            num_reqs,
+            torch.from_numpy(_qsl_np),
+            torch.from_numpy(positions_np),
+        )
 
         query_start_loc_np = self.query_start_loc.np.copy()
         query_start_loc_np[0] = 0
@@ -2428,7 +2693,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             vocab_size=self.model_config.get_vocab_size(),
             block_sizes=[self.cache_config.block_size],
             kernel_block_sizes=[self.cache_config.block_size],
-            is_spec_decode=bool(self.vllm_config.speculative_config),
+            # vLLM 0.22 replaced InputBatch's is_spec_decode flag with
+            # num_spec_tokens; RBLN Unlimited-OCR doesn't use spec decode.
+            num_spec_tokens=(
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config is not None
+                else 0
+            ),
             logitsprocs=build_logitsprocs(
                 self.vllm_config,
                 self.device,
@@ -2466,7 +2737,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
-                is_spec_decode=bool(self.vllm_config.speculative_config),
+                # vLLM 0.22 replaced InputBatch's is_spec_decode flag with
+            # num_spec_tokens; RBLN Unlimited-OCR doesn't use spec decode.
+            num_spec_tokens=(
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config is not None
+                else 0
+            ),
                 logitsprocs=dummy_input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=dummy_input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
@@ -3561,7 +3838,7 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     )
 
             if self.supports_mm_inputs:
-                mm_embed_inputs = self._gather_mm_embeddings(
+                mm_embed_inputs, _ = self._gather_mm_embeddings(
                     scheduler_output,
                     shift_computed_tokens=1,
                 )
@@ -4201,7 +4478,13 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 block_sizes=block_sizes,
                 kernel_block_sizes=kernel_block_sizes,
                 max_num_blocks_per_req=max_num_blocks,
-                is_spec_decode=bool(self.vllm_config.speculative_config),
+                # vLLM 0.22 replaced InputBatch's is_spec_decode flag with
+            # num_spec_tokens; RBLN Unlimited-OCR doesn't use spec decode.
+            num_spec_tokens=(
+                self.vllm_config.speculative_config.num_speculative_tokens
+                if self.vllm_config.speculative_config is not None
+                else 0
+            ),
                 logitsprocs=self.input_batch.logitsprocs,
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
@@ -4279,6 +4562,17 @@ class RBLNModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 kv_cache_spec = next(iter(kv_cache_spec.kv_cache_specs.values()))
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
+            elif isinstance(kv_cache_spec, RBLNPrefillAwareSlidingWindowSpec):
+                # PA-SWA stores the full KV cache and applies the
+                # prefill-aware visibility window in attention metadata, so use
+                # the same kernel block selection as full attention rather than
+                # the one-block regular SWA kernel.
+                attn_groups = self.attn_groups[kv_cache_gid]
+                kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
+                selected_kernel_size = self.select_common_block_size(
+                    kv_manager_block_size, attn_groups
+                )
+                kernel_block_sizes.append(selected_kernel_size)
             elif isinstance(kv_cache_spec, RBLNSlidingWindowSpec):
                 kernel_block_sizes.append(kv_cache_spec.sliding_window)
             elif isinstance(kv_cache_spec, AttentionSpec):

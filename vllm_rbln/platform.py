@@ -101,6 +101,21 @@ class RblnPlatform(Platform):
         return False
 
     @classmethod
+    def manual_seed_all(cls, seed: int) -> None:
+        """Seed host RNGs. vLLM 0.22 calls this during engine-core init; the
+        base Platform raises NotImplementedError. RBLN execution is driven by
+        compiled graphs on the NPU and greedy sampling runs on CPU, so seeding
+        torch's CPU generator (and python/numpy) is sufficient and matches
+        what seed_everything did previously."""
+        import random
+
+        import numpy as np
+
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+
+    @classmethod
     def get_device_communicator_cls(cls) -> str:
         return "vllm_rbln.distributed.rbln_communicator.RblnCommunicator"  # noqa
 

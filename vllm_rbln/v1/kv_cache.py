@@ -19,7 +19,7 @@ import vllm.v1.core.single_type_kv_cache_manager as single_type_kv_cache_manager
 from vllm.config import VllmConfig
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 from vllm.v1.request import Request
 
 
@@ -92,8 +92,32 @@ class RBLNSlidingWindowManager(SingleTypeKVCacheManager):
         return 0
 
 
+@dataclass(frozen=True)
+class RBLNPrefillAwareSlidingWindowSpec(FullAttentionSpec):
+    """KV-cache spec marker for prefill-aware sliding-window attention.
+
+    PA-SWA is semantically different from regular SWA: decode must preserve all
+    prefill tokens while sliding only the decode tail. The existing
+    ``RBLNSlidingWindowManager`` stores a single in-place sliding block per
+    request, so it must not be reused as the production PA-SWA manager.
+    """
+
+    def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+        # Conservative upper bound until a real PA-SWA allocator is introduced:
+        # normal attention cache capacity, not regular one-window SWA capacity.
+        num_model_blocks = max(
+            1, vllm_config.model_config.max_model_len // self.block_size
+        )
+        return self.page_size_bytes * num_model_blocks
+
+
 single_type_kv_cache_manager.spec_manager_map.update(
     {
         RBLNSlidingWindowSpec: RBLNSlidingWindowManager,
+        # PA-SWA uses the normal full-cache allocator and enforces
+        # “all prefill + latest decode window” visibility in attention metadata.
+        # This is intentionally not the one-block regular SWA manager, which
+        # would evict protected prefill KV.
+        RBLNPrefillAwareSlidingWindowSpec: SingleTypeKVCacheManager,
     }
 )

@@ -23,7 +23,14 @@ import torch
 from vllm.config import ModelConfig, ParallelConfig
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.platforms import CpuArchEnum, current_platform
-from vllm.platforms.cpu import CpuPlatform, LogicalCPUInfo
+from vllm.platforms.cpu import CpuPlatform
+
+try:
+    # vLLM 0.22 moved LogicalCPUInfo from vllm.platforms.cpu to
+    # vllm.utils.cpu_resource_utils.
+    from vllm.utils.cpu_resource_utils import LogicalCPUInfo
+except ImportError:
+    from vllm.platforms.cpu import LogicalCPUInfo
 
 import vllm_rbln.rbln_envs as envs
 from vllm_rbln.logger import init_logger
@@ -242,7 +249,35 @@ def get_autobind_cpu_ids(
     Returns:
         Comma-separated string of CPU IDs, or "all" or "nobind".
     """
-    allowed_numa_nodes, logical_cpu_list = CpuPlatform.get_allowed_cpu_core_node_list()
+    # vLLM 0.22 removed CpuPlatform.get_allowed_cpu_core_node_list(); the same
+    # information now comes from vllm.utils.cpu_resource_utils (get_allowed_cpu_list
+    # for logical CPUs, get_memory_affinity for allowed NUMA nodes). Fall back to
+    # the old API on older vLLM, and to no-binding ("all") if neither is present --
+    # thread pinning is a NUMA perf optimization, not required for correctness.
+    if hasattr(CpuPlatform, "get_allowed_cpu_core_node_list"):
+        allowed_numa_nodes, logical_cpu_list = (
+            CpuPlatform.get_allowed_cpu_core_node_list()
+        )
+    else:
+        try:
+            from vllm.utils.cpu_resource_utils import (
+                get_allowed_cpu_list,
+                get_memory_affinity,
+            )
+
+            logical_cpu_list = get_allowed_cpu_list()
+            allowed_numa_nodes = get_memory_affinity()
+            if not allowed_numa_nodes:
+                allowed_numa_nodes = sorted(
+                    {c.numa_node for c in logical_cpu_list if c.numa_node >= 0}
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Auto thread-binding unavailable on this vLLM (%s); "
+                "skipping CPU pinning.",
+                exc,
+            )
+            return "all"
 
     # Calculate rank_across_dp for CPU binding
     # This ensures different DP groups get different CPU allocations

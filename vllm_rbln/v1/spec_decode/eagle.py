@@ -20,10 +20,28 @@ import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.distributed.parallel_state import get_dp_group, get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context
-from vllm.v1.attention.backends.tree_attn import TreeAttentionMetadata
+try:
+    from vllm.v1.attention.backends.tree_attn import TreeAttentionMetadata
+except ImportError:
+    # vLLM removed the tree-attention backend (vllm.v1.attention.backends.tree_attn)
+    # in 0.22. RBLN doesn't support tree attention anyway (see the isinstance
+    # guard below), so fall back to a sentinel type that isinstance never
+    # matches, keeping this Eagle spec-decode module importable on newer vLLM.
+    class TreeAttentionMetadata:  # type: ignore[no-redef]
+        pass
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, EagleProposer
+from vllm.v1.spec_decode.eagle import EagleProposer
+
+try:
+    # vLLM 0.22 moved PADDING_SLOT_ID out of vllm.v1.spec_decode.eagle into
+    # vllm.v1.spec_decode.utils.
+    from vllm.v1.spec_decode.utils import PADDING_SLOT_ID
+except ImportError:
+    try:
+        from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID
+    except ImportError:
+        PADDING_SLOT_ID = -1
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 

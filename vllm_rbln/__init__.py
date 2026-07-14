@@ -21,9 +21,14 @@ def register():
 
 
 def register_model():
-    if not envs.VLLM_RBLN_USE_VLLM_MODEL:
-        from vllm import ModelRegistry
+    from vllm import ModelRegistry
 
+    ModelRegistry.register_model(
+        "UnlimitedOCRForCausalLM",
+        "vllm_rbln.model_executor.models.unlimited_ocr:UnlimitedOCRForCausalLM",
+    )
+
+    if not envs.VLLM_RBLN_USE_VLLM_MODEL:
         ModelRegistry.register_model(
             "T5WithLMHeadModel",
             "vllm_rbln.model_executor.models.optimum.t5:RBLNT5ForConditionalGeneration",
@@ -45,17 +50,82 @@ def register_model():
 def register_ops():
     import vllm_rbln.distributed.ec_transfer.ec_connector.factory  # noqa
 
+    # Always apply: needed by both the standard engine path and the custom
+    # Unlimited-OCR experimental runtime (which calls register_ops() with
+    # VLLM_RBLN_USE_VLLM_MODEL=False). vLLM's ViT `torch_sdpa_wrapper` has a
+    # fake-impl signature bug: the real op declares `scale=None,
+    # cu_seqlens=None` defaults but `torch_sdpa_wrapper_fake` omits them, so
+    # fake-tensor propagation during torch.compile of the ViT/CLIP encoder
+    # fails ("torch_sdpa_wrapper_fake() missing 1 required positional
+    # argument: 'cu_seqlens'"). This blocks compiling the vision frontend on
+    # RBLN. The fake can't be re-registered (already registered), so bypass
+    # the opaque custom op entirely: point the mm-encoder's wrapper at the
+    # plain `torch_sdpa_wrapper` function, which decomposes to aten SDPA
+    # in-graph (no custom op, no fake). Behaviorally identical in eager;
+    # makes the ViT graph rebel-compilable.
+    try:
+        import vllm.model_executor.layers.attention.mm_encoder_attention as _mea
+        import vllm.v1.attention.ops.vit_attn_wrappers as _vaw
+
+        _mea.vit_torch_sdpa_wrapper = _vaw.torch_sdpa_wrapper
+    except Exception:
+        pass
+
     if envs.VLLM_RBLN_USE_VLLM_MODEL:
+        # Disable vLLM's IR-op torch custom-op wrapping. With it enabled,
+        # `vllm.ir` ops (rms_norm, fused_add_rms_norm, ...) appear in the
+        # traced graph as opaque `vllm_ir::*` custom ops. RBLN lowers graphs
+        # with rebel-compiler (not Inductor), which cannot lower those opaque
+        # ops -- so compile fails and falls back to CPU eager. Disabling the
+        # wrapper makes IR ops dispatch straight to their native torch
+        # implementation, decomposing into primitive ops rebel-compiler can
+        # lower. This is the wrapper's documented use case ("avoiding the need
+        # for lowering for platforms not using Inductor").
+        try:
+            from vllm.ir.op import set_default_torch_wrap
+
+            set_default_torch_wrap(False)
+        except ImportError:
+            pass
+
         import vllm_rbln.model_executor.layers.attention.attention  # noqa
         import vllm_rbln.distributed.kv_transfer.kv_connector.factory  # noqa
         import vllm_rbln.forward_context  # noqa
         import vllm_rbln.lora.layer  # noqa
         import vllm_rbln.model_executor.layers.fused_moe.layer  # noqa
-        import vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe  # noqa
+
+        try:
+            import vllm_rbln.model_executor.layers.fused_moe.shared_fused_moe  # noqa
+        except ImportError:
+            # vLLM merged SharedFusedMoE's shared-expert handling directly
+            # into FusedMoE (see fused_moe/runner/shared_experts.py); the
+            # standalone class this patch targets no longer exists on newer
+            # vLLM versions. None of our currently supported models
+            # (Unlimited-OCR/DeepSeekV2 included) construct SharedFusedMoE
+            # directly, so skip rather than block all RBLN model loading.
+            pass
         import vllm_rbln.model_executor.layers.logits_processor  # noqa
-        import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
+
+        try:
+            import vllm_rbln.model_executor.layers.quantization.kernels.mixed_precision  # noqa
+        except ImportError:
+            # compressed_tensors reorganized its compressor submodules
+            # (quantized_compressors -> pack_quantized/naive_quantized/etc)
+            # on newer versions; this mixed-precision quant kernel patch
+            # isn't needed for Unlimited-OCR's unquantized bf16 model, so
+            # skip rather than block all RBLN model loading.
+            pass
         import vllm_rbln.model_executor.layers.quantization.mxfp4  # noqa
-        import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
+
+        try:
+            import vllm_rbln.model_executor.layers.quantization.fp8  # noqa
+        except ImportError:
+            # vLLM renamed/reorganized fp8_utils helpers on newer versions
+            # (e.g. maybe_post_process_fp8_weight_block ->
+            # deepgemm_post_process_fp8_weight_block); this fp8 quant patch
+            # isn't needed for Unlimited-OCR's unquantized bf16 model, so
+            # skip rather than block all RBLN model loading.
+            pass
         import vllm_rbln.model_executor.layers.rotary_embedding.base  # noqa
         import vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa
         import vllm_rbln.model_executor.layers.vocab_parallel_embedding  # noqa

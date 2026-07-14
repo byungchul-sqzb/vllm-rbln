@@ -72,7 +72,14 @@ def rope_forward_oot(
     if offsets is not None:
         positions = positions + offsets
 
-    batch_size, seq_len = positions.shape[0], positions.shape[1]
+    if positions.ndim == 1:
+        # vLLM's flattened-token convention: positions is [num_tokens] with
+        # no explicit batch dim (batch and seq_len are folded together).
+        # query/key here are correspondingly [num_tokens, hidden], so
+        # treat this as a single batch spanning all tokens.
+        batch_size, seq_len = 1, positions.shape[0]
+    else:
+        batch_size, seq_len = positions.shape[0], positions.shape[1]
     rotate_fn = rotate_neox if self.is_neox_style else rotate_gptj
 
     positions_flat = positions.flatten()

@@ -183,3 +183,9 @@ _version.py
 profile/
 cache_dir/
 rsd_cache_dir/
+
+# Local Unlimited-OCR experiment artifacts
+.omx/
+examples/experimental/unlimited_ocr/experiments/
+examples/experimental/unlimited_ocr/examples/
+examples/experimental/unlimited_ocr/docs/
