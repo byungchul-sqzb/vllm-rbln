@@ -2106,7 +2106,48 @@ def _ensure_vllm_rbln_language_imports() -> None:
 
     vllm_rbln.register_model()
     vllm_rbln.register_ops()
+
+    # Disable vLLM's IR-op torch custom-op wrapping for this custom runtime.
+    # register_ops() only does this inside its `if VLLM_RBLN_USE_VLLM_MODEL:`
+    # branch, but this runtime deliberately runs with
+    # VLLM_RBLN_USE_VLLM_MODEL=False (see vllm_rbln/__init__.py register_ops
+    # comment). Without it, `vllm.ir` ops (rms_norm, fused_add_rms_norm) stay
+    # opaque `vllm_ir::*` custom ops that rebel-compiler cannot lower, so the
+    # decode graph fails to compile and falls back to CPU eager. Disabling the
+    # wrapper makes them dispatch to native torch and decompose into primitive
+    # ops rebel-compiler can lower.
+    try:
+        from vllm.ir.op import set_default_torch_wrap
+
+        set_default_torch_wrap(False)
+    except ImportError:
+        pass
+
     import vllm_rbln.model_executor.layers.fused_moe.layer  # noqa: F401
+
+    # Apply the RBLN model-layer patches that the natively-constructed
+    # DeepseekV2 decode relies on. register_ops() only installs these inside
+    # its `if VLLM_RBLN_USE_VLLM_MODEL:` branch, but this runtime runs with
+    # VLLM_RBLN_USE_VLLM_MODEL=False and constructs the model directly, so it
+    # must import them here. In particular
+    # model_executor.layers.attention.attention patches
+    # unified_attention_with_output to (a) resolve the KV cache from
+    # attn_metadata so it appears as a graph input, (b) add the
+    # kv_cache_dummy_dep data dependency that makes torch.compile preserve the
+    # KV-update/attention ordering, and (c) copy the impl result into vLLM
+    # 0.22's uninitialized `output` buffer. Without it the vanilla dispatcher
+    # produces a different decode graph (KV/mask input arity mismatch ->
+    # "Number of inputs (38) exceeds the expected number (26)") and risks the
+    # uninitialized-output bug. The remaining patches match the gated block.
+    import vllm_rbln.forward_context  # noqa: F401
+    import vllm_rbln.model_executor.layers.attention.attention  # noqa: F401
+    import vllm_rbln.model_executor.layers.logits_processor  # noqa: F401
+    import vllm_rbln.model_executor.layers.rotary_embedding.base  # noqa: F401
+    import vllm_rbln.model_executor.layers.rotary_embedding.deepseek_scaling_rope  # noqa: F401,E501
+    import vllm_rbln.model_executor.layers.vocab_parallel_embedding  # noqa: F401
+    import vllm_rbln.model_executor.model_loader.weight_loader  # noqa: F401
+    import vllm_rbln.models.deepseek_v2  # noqa: F401
+
     from vllm_rbln.torch_compile_backend import logged_rbln_backend  # noqa: F401
 
     def _pa_swa_check_and_update_config(cls, vllm_config: Any) -> None:
